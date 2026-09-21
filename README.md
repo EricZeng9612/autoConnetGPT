@@ -1,5 +1,7 @@
 # autoConnetGPT
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 `autoConnetGPT` 是一个面向 macOS 的轻量级后台连接守护程序，用于提高 ChatGPT/Codex Remote 主机的可用性。它会在登录后自动启动，立即执行一次健康检查，随后默认每小时检查 Clash、代理链路、ChatGPT 桌面应用和 Codex App Server，并在安全边界内尝试自动恢复。
 
 > 这是个人维护工具，不是 OpenAI 官方产品。项目名 `autoConnetGPT` 按原始命名保留。
@@ -120,3 +122,7 @@ zsh uninstall.zsh
 - 不要将 Codex App Server 直接暴露到公共互联网。OpenAI 建议跨网络访问时使用 VPN 或网状网络。
 
 参考：[OpenAI Remote connections](https://learn.chatgpt.com/docs/remote-connections)
+
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
