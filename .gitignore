@@ -3,3 +3,12 @@
 *.tmp
 *.zip
 status.txt
+__pycache__/
+*.pyc
+config.json
+recovery.json
+status.json
+*.lock
+python-path
+*.secret
+.test-state/

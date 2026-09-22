@@ -1,0 +1,19 @@
+{
+  "interval_seconds": 3600,
+  "proxy_url": "http://127.0.0.1:7897",
+  "basic_urls": ["https://www.baidu.com/", "https://www.qq.com/"],
+  "general_url": "https://www.gstatic.com/generate_204",
+  "chatgpt_url": "https://chatgpt.com/",
+  "controller_socket": "/tmp/verge/verge-mihomo.sock",
+  "controller_url": "http://127.0.0.1:9090",
+  "controller_secret_file": "",
+  "selector_group": "",
+  "singapore_nodes": [],
+  "allow_singapore_name_match": false,
+  "max_candidates": 20,
+  "latency_samples": 3,
+  "max_switches": 3,
+  "remote_evidence_file": "",
+  "task_evidence_file": "",
+  "notifications": true
+}

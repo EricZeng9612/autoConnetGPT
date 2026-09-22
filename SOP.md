@@ -1,58 +1,55 @@
-# autoConnetGPT 故障处理 SOP
+# 连接恢复 SOP · v2
 
-## 自动处理顺序
+适用：macOS + ChatGPT 内置 Codex App Server + Clash Verge/Mihomo。先网络，后应用，最后 Remote。完整[流程图](docs/FLOWCHART.md)与代码一起维护。
 
-1. 检查 Clash 代理端口 `127.0.0.1:7897`。
-2. 通过该代理访问 `https://chatgpt.com/`；HTTP 200–499 视为网络已连通。
-3. VPN 异常时先启动 Clash；仍失败才重启 Clash，最多执行两级恢复。
-4. VPN 正常后检查 ChatGPT 主进程与 Codex App Server。
-5. ChatGPT 未运行时启动；只有 VPN 正常但 App Server 缺失时才重启 ChatGPT。
-6. 保存状态并仅在状态变化或需要人工处理时发送本机通知。
+## 1. 先看状态，不盲目重启
 
-## 状态说明
+运行 `autoConnetGPT.zsh --status` 查看最近结果；`--diagnose` 只读探测，不修改节点或重启应用。`--check` 才允许恢复。桌面通知、状态文件中的 `actions` 会说明本轮已执行的动作。没有接入状态采集器时出现 `REMOTE_UNKNOWN` 是预期行为。
 
-- `HEALTHY`：所有检查正常。
-- `VPN_REPAIRED`：已自动恢复 Clash/VPN。
-- `CODEX_REPAIRED`：已自动恢复 ChatGPT/Codex。
-- `HOST_SLEEP_RISK`：系统仍存在整机睡眠风险，且守护程序没有保持唤醒。
-- `VPN_NEEDS_ATTENTION`：自动重启后仍无法通过代理访问 ChatGPT；请手动切换 Clash 节点。
-- `REMOTE_NEEDS_ATTENTION`：本地网络可用，但 ChatGPT/Codex 无法恢复；检查登录、远程控制和设备配对。
+确认主机接电、用户已登录，区分屏幕熄灭与整机睡眠。用 `pmset -g custom` 查看 AC/电池设置，用 `pmset -g assertions` 查看防睡眠断言。程序不自行修改电源配置；完全睡眠、合盖或断电不是脚本可保证自救的情况。
 
-## 人工处理
+## 2. 基础网络 → Clash → 代理链路
 
-### VPN_NEEDS_ATTENTION
+1. 基础 HTTPS 探测未通过：先检查 Wi-Fi、网线、路由器和认证门户；不切节点，不重启 GPT。
+2. Clash 内核或代理端口缺失：先打开 Clash，等 15 秒；仍异常时正常退出并重启一次，再等 15 秒。正常退出失败则人工处理，不强杀。恢复批次冷却 30 分钟。
+3. 通过当前代理分别探测通用 HTTPS 目标与 ChatGPT。连接失败隔 10 秒再确认。收到 4xx/5xx 标记未知，不把 403 当成健康或 VPN 故障。检查登录限制、验证页面、服务端故障、路由规则及探测目标。
+4. 两次代理传输失败且基础网络通过：进入新加坡节点优选。控制 API 不通/未授权与 Clash 内核故障分开处理。
 
-1. 打开 Clash Verge。
-2. 确认系统代理开启、端口为 `7897`。
-3. 切换到另一个可用节点。
-4. 运行：
+## 3. 新加坡节点优选与回滚
 
-   ```bash
-   "$HOME/Library/Application Support/autoConnetGPT/autoConnetGPT.zsh" --check
-   ```
+1. 只读取配置指定的手动 `Selector` 组；必须确认该组实际控制目标出站。保存其原选择。
+2. 从该组直接叶子成员中筛选确认的新加坡名单，排除当前节点、DIRECT、REJECT 与嵌套组。没有候选则停止；不会随意换到其他地区。
+3. 对每个候选做默认 3 轮双目标测试。任意测试失败则淘汰；合格者按 ChatGPT 探测延迟中位数升序排列。默认最多 20 个候选，超限要求缩小名单。
+4. 每次切换前把原选择与目标写入私有事务文件，核对当前选择未被外部改变，再切换并回读确认。
+5. 等待 5 秒后经真实代理验证，再间隔 5 秒验证一次。两次通过才接受新节点。
+6. 验证失败恢复原节点，再尝试次低延迟候选，最多 3 个。回滚失败或检测到用户改动时立即停止，保留事务并提示人工处理，不覆盖用户的新选择。
+7. 中断后的下一次检查优先处理未完成回滚，即使尚在节点冷却期。节点恢复批次（包括测速失败）冷却 6 小时。不要通过删除恢复历史来绕过限额。
 
-### REMOTE_NEEDS_ATTENTION
+## 4. ChatGPT 与 App Server
 
-1. 打开 ChatGPT 桌面应用。
-2. 进入“设置 → 连接 → 控制此 Mac”。
-3. 确认“允许其他设备连接”和“保持此 Mac 唤醒”均已开启。
-4. 确认手机和 Mac 使用相同账号及工作空间。
-5. 如果刚重新登录过，重新开启远程控制；仍失败则重新扫描二维码配对。
+网络已通过后才检查应用主进程及其直接子进程 App Server。应用缺失时，可在恢复额度允许时启动，等待 45 秒并复检；不凭“启动成功”就报告 Remote 恢复。
 
-## 常用命令
+App Server 缺失先等待 60 秒复检；确认同一应用实例仍缺失，才进入重启安全门。应用 PID 或启动时间变化，取消本轮重启。
 
-```bash
-# 当前状态
-"$HOME/Library/Application Support/autoConnetGPT/autoConnetGPT.zsh" --status
+## 5. Remote 判断
 
-# 立即检查一次
-"$HOME/Library/Application Support/autoConnetGPT/autoConnetGPT.zsh" --check
+- 在线：必须是来自可信采集器、对应当前应用 PID/启动时间且 120 秒内的在线证据。
+- 失败：间隔 60 秒获得两份时间戳不同的有效失败证据，才允许进入重启安全门。
+- 未知：缺少接口/证据过期/信号不确定时，最多间隔 60 秒重查两次；仍未知则提示人工，不能认定离线。
+- 登录、配对或需手动开启：直接人工处理，不重启绕过。
 
-# 完整诊断
-"$HOME/Library/Application Support/autoConnetGPT/autoConnetGPT.zsh" --diagnostics
+人工检查 ChatGPT 的远程连接设置、同账号登录、手机网络与配对状态。不要拿 `hostId=local`、某个进程存在或旧日志当作手机 Remote 正常的证据。
 
-# 查看日志
-tail -f "$HOME/Library/Logs/autoConnetGPT/autoConnetGPT.log"
-```
+## 6. 重启安全门
 
-守护程序保持整机不因空闲进入睡眠，但不阻止显示器熄屏。手动选择“睡眠”、关机或断电仍会中断远程连接。
+1. 重新确认代理链路通过、应用实例未变；若 Remote 已明确提示登录/配对，即使 App Server 缺失也转人工，不自动重启。
+2. 取得 30 秒内的可信任务状态，明确 `idle` 才继续。忙碌或未知：10 分钟后再查，最多延后两次；之后人工处理。
+3. 确认本轮尚未恢复过应用，满足 6 小时冷却和最多 2 次/24 小时额度。启动应用也计入额度；在动作前持久化计数。
+4. 正常退出 ChatGPT，再重新打开；不是退出账号。退出不成功不强杀。
+5. 等待 45 秒，重新验证代理、应用、App Server 和当前实例的 Remote 证据。仍异常/未知则转人工，本轮不再重启。
+
+## 7. 升级到人工处理
+
+查看 `status.json` 与轮转日志，按结果定位；遇到持续 403/429/5xx 不无限换节点。`VPN_ROLLBACK_REQUIRED` 时先核对原节点与当前用户选择；恢复前不要删除 `recovery.json`。损坏的恢复状态会导致安全停止，而不是把限额当作零重新开始。
+
+如需提交问题，只分享版本、脱敏状态码、复现步骤及操作系统版本。不要上传配置密钥、完整恢复事务、私人节点名称、订阅链接或账号凭据。
