@@ -55,9 +55,9 @@ def manage(action):
     service = domain + "/" + LABEL
     if action == "install":
         # Validate all inputs before stopping an existing installation.
-        from autoConnetGPT import config_load
+        from autoConnetGPT import config_load, VERSION
         config_load(target / "config.json")
-        files = ["autoConnetGPT.py", "autoConnetGPT.zsh", "manage.py", "install.zsh",
+        files = ["autoConnetGPT.py", "transport_health.py", "autoConnetGPT.zsh", "manage.py", "install.zsh",
                  "uninstall.zsh", "README.md", "SOP.md", "SECURITY.md", "LICENSE", "config.example.json"]
         payloads = {name: (source / name).read_bytes() for name in files}
         compile(payloads["autoConnetGPT.py"], "autoConnetGPT.py", "exec")
@@ -107,7 +107,7 @@ def manage(action):
     command("bootstrap", domain, agent)  # RunAtLoad already starts it; no duplicate kickstart.
     time.sleep(1)
     command("print", service)
-    print("Installed autoConnetGPT 2.0.0. It performs an immediate check.")
+    print("Installed autoConnetGPT " + VERSION + ". It performs an immediate check.")
     print("Configuration:", target / "config.json")
     print("Status:", str(target / "autoConnetGPT.zsh") + " --status")
 

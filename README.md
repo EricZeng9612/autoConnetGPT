@@ -25,7 +25,11 @@ Auto Connect GPT 是一个面向中国大陆 macOS 用户的轻量级后台连�
 
 ## 必须知道的检测边界
 
-**v2 已实现 Remote 三态判断和安全恢复状态机，但没有附带官方 Remote/任务状态采集器。** 默认配置下，Remote 状态为 `REMOTE_UNKNOWN`，不会因为缺少证据而重启应用。要启用基于 Remote 故障的自动恢复，必须接入可验证的在线状态和任务空闲证据，格式见 [状态采集器接口](docs/EVIDENCE.md)。不要用固定 JSON、历史日志、进程存在或端口连通来伪造在线/空闲状态。
+**v2.1 可只读分析当前 App Server 的原生日志，识别 HTTP/SSE、模型 WebSocket、Remote 断流与上下文整理失败。** 日志绑定进程 PID 和启动时间，仅统计最近 5 分钟；主机 Remote 握手证据 120 秒后过期。没有日志、结构变化或证据不完整时保持未知，不推断手机在线。
+
+程序仍没有可靠的内置“任务空闲”采集器，默认不会自动重启正在运行的 ChatGPT。需重启恢复时必须接入可信的任务空闲证据，格式见 [状态采集器接口](docs/EVIDENCE.md)。短请求通过、主机握手成功均不保证手机连接或长任务成功，不要用固定 JSON 或旧日志伪造状态。
+
+`stream disconnected` 不一定是 WebSocket 单独故障。程序不会修改 Codex 的传输协议、写入旧版实验开关，或把 HTTP/1.1 当成通用解法。默认只报告重复断流；显式启用 `recover_stream_failures` 后，只有模型流与 Remote 在同一观察窗口都重复失败，才尝试受限节点优选。这是恢复尝试，不是对 VPN 根因的断言。
 
 **自动切换节点默认未启用。** 必须配置你允许程序修改的一个 Mihomo `Selector` 代理组，以及确认位于新加坡的候选节点名单。本程序不改变订阅、不新增节点、不自动修改路由规则。该代理组必须实际影响 ChatGPT/Remote 的出站路径。
 
@@ -36,7 +40,9 @@ Auto Connect GPT 是一个面向中国大陆 macOS 用户的轻量级后台连�
 ```mermaid
 flowchart LR
     A[登录启动 / 每小时] --> B[基础网络与 VPN 代理]
-    B -->|通过| C[ChatGPT / Codex App Server]
+    B -->|通过| S[检查近期模型流与 Remote 断流]
+    S -->|无重复失败证据| C[ChatGPT / Codex App Server]
+    S -->|重复失败| E
     C -->|通过| D[Remote 有效状态证据]
     B -->|失败或未知| E[网络恢复 / 明确提示]
     C -->|持续异常| F[空闲确认 + 冷却检查]
@@ -73,7 +79,7 @@ zsh install.zsh
   "selector_group": "填写实际生效的手动选择组名",
   "singapore_nodes": ["填写新加坡节点完整名称一", "填写新加坡节点完整名称二"],
   "allow_singapore_name_match": false,
-  "controller_socket": "/tmp/verge/verge-mihomo.sock",
+  "controller_socket": "auto",
   "controller_url": "http://127.0.0.1:9090",
   "controller_secret_file": ""
 }
@@ -82,7 +88,9 @@ zsh install.zsh
 - 名称必须与 Clash 中完全一致。只支持该组的**直接叶子节点**，不递归修改嵌套策略组。
 - 推荐明确的 `singapore_nodes` 白名单；节点地理位置由你/供应商确认。可选名称匹配识别 `新加坡`、`Singapore`、`SG` 等，但名称不等于真实出口位置，因此默认关闭。
 - 默认最多 20 个候选，每节点 3 轮“双目标”测试，以 ChatGPT 目标延迟中位数排序。超过候选上限会要求缩小名单，不会悄悄取部分节点后宣称最低。
-- 优先使用已存在的本地 Unix socket；没有 socket 时使用配置的 loopback HTTP 控制接口。控制接口不可访问/未授权，不会被当成内核故障而重启 Clash。
+- `controller_socket: "auto"` 自动发现当前用户临时目录或旧版路径下的安全 Unix socket；都没有时才使用配置的 loopback HTTP 接口。显式指定的 socket 不存在时直接停止，不悄悄换控制器。控制接口不可访问/未授权不等同于内核故障。
+- 切换前校验实际线路：全局模式沿 `GLOBAL` 当前选择链确认目标组；规则模式要求观察到 OpenAI 活动连接，且这些连接都经过目标组。无证据或流量分流时报告 `VPN_ROUTE_UNCONFIRMED`，不改代理模式/规则。切换全局组会影响其他经过该组的流量，请只授权你接受的组。
+- 默认 ChatGPT 探测为 `/cdn-cgi/trace`，仅检查到该域名的 HTTPS 可达性，不检查登录、模型服务或长连接。已安装版本保留原配置，升级时需自行把旧 socket 改为 `auto`、旧首页探测地址改为示例值。
 - 若控制接口需要密钥，将其放入当前用户拥有的独立文件，权限 `600`，在 `controller_secret_file` 填绝对路径。不要写入仓库或公开 issue。
 - 探测收到 403、429 或 5xx 会报告“无法确认”，**不会一律判为健康，也不会因此切节点**。需要先人工辨别验证页面、服务端故障或权限问题。
 - `basic_urls` 应是当前网络可直接访问的 HTTPS 地址；TUN/透明代理环境下，“不使用 HTTP 代理”不代表完全绕过 VPN，可能需要调整探测目标。
@@ -107,6 +115,9 @@ launchctl kickstart -k "gui/$(id -u)/com.eric.autoConnetGPT"
 # 立即检查，允许按安全规则恢复
 "$HOME/Library/Application Support/autoConnetGPT/autoConnetGPT.zsh" --check
 
+# 仅看当前 App Server 最近的脱敏断流计数，不发送网络请求
+"$HOME/Library/Application Support/autoConnetGPT/autoConnetGPT.zsh" --diagnose-transport
+
 # 最近状态及当前电源设置/睡眠断言
 "$HOME/Library/Application Support/autoConnetGPT/autoConnetGPT.zsh" --diagnostics
 
@@ -121,6 +132,9 @@ tail -f "$HOME/Library/Application Support/autoConnetGPT/autoConnetGPT.log"
 | `HEALTHY` | 当前检查的代理、本地应用、有效 Remote 证据均通过；不是永久在线保证 |
 | `NETWORK_UNAVAILABLE` | 优先检查基础网络、路由器、Wi-Fi 认证 |
 | `VPN_PATH_UNKNOWN` | HTTP 返回结果不够确定；人工辨别，不自动切换 |
+| `STREAM_UNSTABLE` | 近期存在重复断流/压缩失败；短请求或一次握手成功不足以确认恢复 |
+| `VPN_ROUTE_UNCONFIRMED` | 目标组未证实控制实际线路；检查当前代理模式及规则 |
+| `VPN_CLIENT_UNSUPPORTED` | 代理端口开放但没有受支持的 Clash 内核；不启动 Clash 与其他客户端争抢端口 |
 | `VPN_CONFIG_REQUIRED` / `VPN_NO_SG_NODE` | 需配置代理组/候选，或本轮没有通过测试的新加坡节点 |
 | `VPN_CONTROLLER_UNAVAILABLE` | 检查本地控制接口和密钥权限 |
 | `VPN_ROLLBACK_REQUIRED` / `VPN_SELECTION_CHANGED` | 回滚受阻或外部修改节点，停止自动操作 |

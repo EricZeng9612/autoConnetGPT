@@ -14,26 +14,30 @@ import re
 import shlex
 import signal
 import socket
+import stat
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
 from urllib.parse import quote, urlencode, urlsplit
+import transport_health
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 DEFAULT_DIR = Path.home() / "Library/Application Support/autoConnetGPT"
 DEFAULTS = {
     "interval_seconds": 3600, "proxy_url": "http://127.0.0.1:7897",
     "basic_urls": ["https://www.baidu.com/", "https://www.qq.com/"],
     "general_url": "https://www.gstatic.com/generate_204",
-    "chatgpt_url": "https://chatgpt.com/",
-    "controller_socket": "/tmp/verge/verge-mihomo.sock",
+    "chatgpt_url": "https://chatgpt.com/cdn-cgi/trace",
+    "controller_socket": "auto",
     "controller_url": "http://127.0.0.1:9090", "controller_secret_file": "",
     "selector_group": "", "singapore_nodes": [],
     "allow_singapore_name_match": False, "max_candidates": 20,
     "latency_samples": 3, "max_switches": 3,
     "remote_evidence_file": "", "task_evidence_file": "", "notifications": True,
+    "codex_log_db": str(Path.home() / ".codex/logs_2.sqlite"),
+    "recover_stream_failures": False,
 }
 
 
@@ -88,7 +92,7 @@ def config_load(path):
                         "latency_samples": (1, 5), "max_switches": (1, 3)}.items():
         if type(cfg[key]) is not int or not limits[0] <= cfg[key] <= limits[1]:
             raise GuardError("Invalid " + key)
-    for key in ("notifications", "allow_singapore_name_match"):
+    for key in ("notifications", "allow_singapore_name_match", "recover_stream_failures"):
         if type(cfg[key]) is not bool:
             raise GuardError("Invalid " + key)
     for key in ("basic_urls", "singapore_nodes"):
@@ -97,7 +101,7 @@ def config_load(path):
     if not 1 <= len(cfg["basic_urls"]) <= 3:
         raise GuardError("Use one to three basic_urls")
     for key in set(cfg) - {"basic_urls", "singapore_nodes", "notifications",
-                           "allow_singapore_name_match", "interval_seconds", "max_candidates",
+                           "allow_singapore_name_match", "recover_stream_failures", "interval_seconds", "max_candidates",
                            "latency_samples", "max_switches"}:
         if not isinstance(cfg[key], str):
             raise GuardError("Invalid " + key)
@@ -111,8 +115,8 @@ def config_load(path):
                 or not parsed.port or parsed.username or parsed.password
                 or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
             raise GuardError(key + " must be a loopback HTTP endpoint")
-    for key in ("controller_socket", "controller_secret_file", "remote_evidence_file", "task_evidence_file"):
-        if cfg[key] and not Path(cfg[key]).is_absolute():
+    for key in ("controller_socket", "controller_secret_file", "remote_evidence_file", "task_evidence_file", "codex_log_db"):
+        if cfg[key] and not (key == "controller_socket" and cfg[key] == "auto") and not Path(cfg[key]).is_absolute():
             raise GuardError(key + " must be an absolute path")
     return cfg
 
@@ -149,8 +153,9 @@ class Mihomo:
 
     def request(self, method, path, body=None):
         cfg = self.cfg
-        if cfg["controller_socket"] and Path(cfg["controller_socket"]).exists():
-            conn = UnixHTTP(cfg["controller_socket"])
+        socket_path = self.controller_socket()
+        if socket_path:
+            conn = UnixHTTP(socket_path)
         else:
             url = urlsplit(cfg["controller_url"])
             conn = http.client.HTTPConnection(url.hostname, url.port, timeout=8)
@@ -174,6 +179,24 @@ class Mihomo:
         finally:
             conn.close()
 
+    def controller_socket(self):
+        configured = self.cfg["controller_socket"]
+        if configured == "auto":
+            candidates = [Path(tempfile.gettempdir()) / "verge-mihomo.sock",
+                          Path("/tmp/verge/verge-mihomo.sock")]
+        else:
+            candidates = [Path(configured)] if configured else []
+        for path in candidates:
+            try:
+                info = path.stat()
+                if stat.S_ISSOCK(info.st_mode) and info.st_uid in (0, os.getuid()):
+                    return str(path)
+            except FileNotFoundError:
+                continue
+        if configured and configured != "auto":
+            raise GuardError("Configured controller socket is missing or unsafe")
+        return None
+
     def proxies(self):
         return self.request("GET", "/proxies")["proxies"]
 
@@ -184,6 +207,27 @@ class Mihomo:
         self.request("PUT", "/proxies/" + quote(group, safe=""), {"name": node})
         if self.group(group).get("now") != node:
             raise GuardError("Selection did not take effect")
+
+    def route_group_active(self, group):
+        mode = self.request("GET", "/configs").get("mode", "").lower()
+        if mode == "global":
+            proxies = self.proxies()
+            current, seen = "GLOBAL", set()
+            while current and current not in seen:
+                if current == group:
+                    return True
+                seen.add(current)
+                current = proxies.get(current, {}).get("now")
+            return False
+        if mode == "rule":
+            # Confirm actual OpenAI traffic traverses the configured selector.
+            connections = self.request("GET", "/connections").get("connections", [])
+            relevant = [c for c in connections if any(
+                c.get("metadata", {}).get("host", "").lower().rstrip(".") == domain
+                or c.get("metadata", {}).get("host", "").lower().rstrip(".").endswith("." + domain)
+                for domain in ("chatgpt.com", "openai.com"))]
+            return bool(relevant) and all(group in c.get("chains", []) for c in relevant)
+        return False
 
     def delay(self, node, url):
         query = urlencode({"url": url, "timeout": 5000, "expected": "200-299"})
@@ -249,16 +293,23 @@ class Mac:
     def app(self):
         rows = self.processes()
         mains = [p for p in rows if p["command"].split(" -", 1)[0] == "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"]
-        if len(mains) != 1:
+        if len(mains) > 1:
+            raise GuardError("Multiple ChatGPT instances; recovery is ambiguous")
+        if not mains:
             return None, False
-        main = mains[0]
-        server = any(p["ppid"] == main["pid"] and self.is_app_server(p["command"]) for p in rows)
-        return main, server
+        main = dict(mains[0])
+        servers = [p for p in rows if p["ppid"] == main["pid"] and self.is_app_server(p["command"])]
+        main["servers"] = [{"pid": p["pid"], "started": p["started"]} for p in servers]
+        return main, bool(servers)
 
     @staticmethod
     def is_app_server(command):
-        executable = "/Applications/ChatGPT.app/Contents/Resources/codex"
-        if not command.startswith(executable + " "):
+        executables = (
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        )
+        executable = next((p for p in executables if command.startswith(p + " ")), None)
+        if executable is None:
             return False
         try:
             # Current builds place global -c flags BEFORE the app-server subcommand.
@@ -281,6 +332,9 @@ class Mac:
                       and "/verge-mihomo" in p["command"] for p in self.processes())
         if not running:
             return False
+        return self.proxy_port_open(cfg)
+
+    def proxy_port_open(self, cfg):
         url = urlsplit(cfg["proxy_url"])
         try:
             with socket.create_connection((url.hostname, url.port), timeout=3):
@@ -433,6 +487,8 @@ class Watchdog:
         if self.dry:
             raise Halt("VPN_NEEDS_ATTENTION", "代理链路故障；只读模式未切换节点。")
         try:
+            if not self.api.route_group_active(group_name):
+                raise Halt("VPN_ROUTE_UNCONFIRMED", "未证实配置的代理组控制当前 OpenAI 出站线路；不切换无效组，也不修改代理模式。")
             group = self.api.group(group_name)
             if group.get("type") != "Selector" or not group.get("now"):
                 raise Halt("VPN_CONFIG_REQUIRED", "仅支持明确指定的手动 Selector 组。")
@@ -464,9 +520,12 @@ class Watchdog:
             self.wait(0)
             if self.api.group(group_name).get("now") != original:
                 raise Halt("VPN_SELECTION_CHANGED", "节点选择已被外部修改，本轮停止。")
+            if not self.api.route_group_active(group_name):
+                raise Halt("VPN_ROUTE_UNCONFIRMED", "测速期间代理模式或线路发生变化；取消切换。")
             self.state["transaction"] = {"group": group_name, "original": original, "candidate": node}
             self.save()
             accepted = False
+            trial_started = self.clock()
             try:
                 self.api.select(group_name, node)
                 self.wait(5)
@@ -474,9 +533,16 @@ class Watchdog:
                     self.wait(5)
                     accepted = self.mac.link(self.cfg) == "ok"
                 if accepted:
+                    # Short probes do not prove persistent streams are stable.
+                    self.wait(30)
+                    observation = self.transport(since=trial_started + 10)
+                    accepted = (self.mac.link(self.cfg) == "ok"
+                                and not transport_health.stream_failure(observation)
+                                and self.api.route_group_active(group_name))
+                if accepted:
                     self.state["transaction"] = None
                     self.save()
-                    self.actions.append("已切换至可用新加坡节点，实测中位延迟 %.0f ms" % latency)
+                    self.actions.append("已切换至探测通过的新加坡节点，中位延迟 %.0f ms；仍需实际长任务验证" % latency)
                     return
             except (OSError, ValueError, GuardError, http.client.HTTPException):
                 pass
@@ -485,6 +551,13 @@ class Watchdog:
                     self.rollback()
         raise Halt("VPN_NEEDS_ATTENTION", "最多三个候选的切换验证均失败，已恢复原节点。")
 
+    def transport(self, since=None):
+        proc, _ = self.mac.app()
+        observation = transport_health.summarize(
+            self.cfg["codex_log_db"], (proc or {}).get("servers", []), self.clock(), since)
+        self.checks["transport"] = observation
+        return observation
+
     def network(self):
         basic = self.mac.basic(self.cfg)
         self.checks["basic_network"] = basic
@@ -492,6 +565,9 @@ class Watchdog:
             raise Halt("NETWORK_UNAVAILABLE", "基础网络不可用或无法确认；先检查 Wi-Fi、路由器、认证门户，不切节点或重启 GPT。")
         if not self.mac.core(self.cfg):
             self.checks["clash"] = "failed"
+            if self.mac.proxy_port_open(self.cfg):
+                self.transport()
+                raise Halt("VPN_CLIENT_UNSUPPORTED", "代理端口已开放，但未检测到受支持的 Clash 内核；可能由其他客户端占用，不启动 Clash 或修改现有代理。")
             self.reserve("clash")
             self.mac.start("Clash Verge")
             self.wait(15)
@@ -513,9 +589,26 @@ class Watchdog:
         if link == "failed":
             self.switch_nodes()
             self.checks["proxy_path"] = "ok"
+        elif link == "ok":
+            observation = self.transport()
+            if transport_health.stream_failure(observation):
+                if (transport_health.cross_channel_failure(observation)
+                        and self.cfg["recover_stream_failures"] and not self.dry):
+                    self.switch_nodes()
+                else:
+                    raise Halt("STREAM_UNSTABLE", "短请求通过，但最近 5 分钟存在重复断流或压缩失败；不能判为稳定，未重启应用。")
 
     def remote(self, proc):
         evidence = fresh_evidence(self.cfg["remote_evidence_file"], proc, self.clock(), 120)
+        if not self.cfg["remote_evidence_file"]:
+            observation = transport_health.summarize(
+                self.cfg["codex_log_db"], proc.get("servers", []), self.clock())
+            self.checks["transport"] = observation
+            if observation.get("available") and not observation.get("error") and not observation.get("truncated"):
+                state = observation["remote_state"]
+                if state in ("connected", "failed"):
+                    evidence = {"status": "healthy" if state == "connected" else "failed",
+                                "observed_at": observation["remote_observed_at"], "source": "host_remote_log"}
         status = evidence.get("status") if evidence else "unknown"
         if status not in ("healthy", "failed", "auth_required", "pairing_required"):
             status = "unknown"
@@ -644,6 +737,8 @@ class Watchdog:
                 self.checks["sleep_assertion"] = self.mac.sleep_protected()
                 self.network()
                 self.application()
+                if transport_health.stream_failure(self.transport()):
+                    raise Halt("STREAM_UNSTABLE", "应用检查完成，但最近 5 分钟仍有重复断流记录；尚未证实稳定恢复。")
                 self.state["deferred"] = {}
                 self.save()
                 if not self.checks["sleep_assertion"]:
@@ -721,7 +816,7 @@ def daemon(watchdog):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     options = parser.add_mutually_exclusive_group(required=True)
-    for flag in ("daemon", "check", "diagnose", "status", "diagnostics", "version"):
+    for flag in ("daemon", "check", "diagnose", "diagnose-transport", "status", "diagnostics", "version"):
         options.add_argument("--" + flag, action="store_true")
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_DIR)
     parser.add_argument("--config", type=Path)
@@ -741,6 +836,12 @@ def main():
     if sys.platform != "darwin":
         parser.error("Real checks require macOS; unit tests can run on other platforms.")
     cfg = config_load(args.config or args.state_dir / "config.json")
+    if args.diagnose_transport:
+        proc, server = Mac().app()
+        report = transport_health.summarize(cfg["codex_log_db"], (proc or {}).get("servers", []))
+        report.update(app_running=bool(proc), app_server_running=server, read_only=True)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
     args.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not args.diagnose:
         setup_logging(args.state_dir)

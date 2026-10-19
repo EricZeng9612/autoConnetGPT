@@ -3,8 +3,8 @@
   "proxy_url": "http://127.0.0.1:7897",
   "basic_urls": ["https://www.baidu.com/", "https://www.qq.com/"],
   "general_url": "https://www.gstatic.com/generate_204",
-  "chatgpt_url": "https://chatgpt.com/",
-  "controller_socket": "/tmp/verge/verge-mihomo.sock",
+  "chatgpt_url": "https://chatgpt.com/cdn-cgi/trace",
+  "controller_socket": "auto",
   "controller_url": "http://127.0.0.1:9090",
   "controller_secret_file": "",
   "selector_group": "",
@@ -15,5 +15,6 @@
   "max_switches": 3,
   "remote_evidence_file": "",
   "task_evidence_file": "",
-  "notifications": true
+  "notifications": true,
+  "recover_stream_failures": false
 }

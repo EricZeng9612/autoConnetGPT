@@ -17,25 +17,31 @@ flowchart TD
     S --> B{基础网络通过?}
     B -->|失败或未知| N[检查 Wi-Fi / 路由器 / 认证门户]
     B -->|是| C{Clash 内核及代理端口正常?}
-    C -->|否| R[冷却允许时启动 Clash<br/>仍异常则正常重启一次]
+    C -->|否| PORT{代理端口被其他客户端占用?}
+    PORT -->|是或无法识别的内核| CONFLICT[保留现有代理 · 不启动 Clash]
+    PORT -->|否| R[冷却允许时启动 Clash<br/>仍异常则正常重启一次]
     R --> RQ{内核与端口恢复?}
     RQ -->|否或冷却限制| M
     RQ -->|是| P
     C -->|是| P{双目标代理探测结果?}
-    P -->|通过| OK([进入 ③ 应用与 Remote])
+    P -->|通过| LOG{近期有重复断流或整理失败?}
+    LOG -->|无失败证据| OK([进入 ③ 应用与 Remote])
+    LOG -->|有| CROSS{模型与 Remote 均重复失败<br/>且已启用断流恢复?}
+    CROSS -->|否| UNSTABLE[报告断流不稳定<br/>不重启 GPT]
+    CROSS -->|是| SG
     P -->|4xx / 5xx 等未知| Q[报告无法确认<br/>不切节点 · 不重启 GPT]
     P -->|传输失败| W[等待 10 秒再探测]
     W --> V{复检结果?}
-    V -->|通过| OK
+    V -->|通过| LOG
     V -->|未知| Q
     V -->|仍失败| SG([进入 ② 新加坡节点优选])
     classDef inspect fill:#eff6ff,stroke:#3b82f6,color:#172554;
     classDef action fill:#fffbeb,stroke:#f59e0b,color:#78350f;
     classDef stop fill:#fff1f2,stroke:#e11d48,color:#881337;
     classDef good fill:#ecfdf5,stroke:#10b981,color:#064e3b;
-    class L,U,S,B,C,P,V inspect;
+    class L,U,S,B,C,P,V,LOG,CROSS,PORT inspect;
     class T,R,W action;
-    class M,N,Q stop;
+    class M,N,Q,UNSTABLE,CONFLICT stop;
     class OK,SG good;
 ```
 
@@ -43,7 +49,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A([代理传输持续故障]) --> C{配置 / 控制接口 / 冷却均允许?}
+    A([代理故障 / 已授权跨通道断流恢复]) --> C{配置 / 控制接口 / 冷却<br/>及实际出站组校验均通过?}
     C -->|否| E[保留原选择 · 提示原因]
     C -->|是| F[筛选指定 Selector 的新加坡叶子节点<br/>排除当前节点 / DIRECT / REJECT / 嵌套组]
     F --> Q{有候选且数量在上限内?}
@@ -53,11 +59,14 @@ flowchart TD
     R --> H{有通过测试的节点?}
     H -->|否| E
     H -->|是| N[从最低延迟开始<br/>每次操作前保存可恢复事务]
-    N --> K{组选择仍未被外部修改?}
+    N --> K{组选择未被外部修改<br/>且仍控制实际线路?}
     K -->|否| E
     K -->|是| SW[切换一个候选并回读确认]
     SW --> V{经实际代理连续两次验证通过?}
-    V -->|是| OK([保留新节点 · 进入 ③])
+    V -->|是| OBS[观察 30 秒<br/>复检代理及当前进程新日志]
+    OBS --> PASS{代理与线路仍通过<br/>且无重复断流证据?}
+    PASS -->|是| OK([保留新节点 · 进入 ③])
+    PASS -->|否| RB
     V -->|否| RB[恢复原节点]
     RB --> B{回滚确认成功?}
     B -->|否| MAN[停止一切自动恢复<br/>保留事务 · 通知人工]
@@ -68,8 +77,8 @@ flowchart TD
     classDef action fill:#fffbeb,stroke:#f59e0b,color:#78350f;
     classDef stop fill:#fff1f2,stroke:#e11d48,color:#881337;
     classDef good fill:#ecfdf5,stroke:#10b981,color:#064e3b;
-    class C,Q,H,K,V,B,NEXT inspect;
-    class F,D,R,N,SW,RB action;
+    class C,Q,H,K,V,B,NEXT,PASS inspect;
+    class F,D,R,N,SW,RB,OBS action;
     class E,MAN stop;
     class OK good;
 ```
@@ -114,7 +123,7 @@ flowchart TD
     class OK,SAFE good;
 ```
 
-Remote 没有证据 ≠ Remote 离线。默认未接入采集器时，此阶段报告未知；不得用 App Server 存在替代远程可用性。应用主进程变化时旧证据作废。
+Remote 没有证据 ≠ Remote 离线。v2.1 默认尝试读取当前 App Server 的新鲜主机侧握手日志；没有有效证据则报告未知，不得用进程存在替代远程可用性。应用实例变化时旧证据作废。完成应用检查后再次检查断流计数，近期仍有重复失败则报告不稳定，不报恢复成功。
 
 ## ④ 重启安全门与闭环
 

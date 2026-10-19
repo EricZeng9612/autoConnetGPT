@@ -45,6 +45,9 @@ class FakeMac:
         self.calls.append("core")
         return self.core_result
 
+    def proxy_port_open(self, cfg):
+        return False
+
     def link(self, cfg):
         self.calls.append("link")
         return self.links.pop(0) if self.links else self.link_default
@@ -91,6 +94,9 @@ class FakeAPI:
 
     def group(self, name):
         return {"type": "Selector", "now": self.current, "all": list(self.nodes)}
+
+    def route_group_active(self, group):
+        return True
 
     def proxies(self):
         return self.nodes
