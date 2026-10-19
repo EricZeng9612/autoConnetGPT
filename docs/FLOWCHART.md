@@ -16,7 +16,11 @@ flowchart TD
     U -->|是| S[记录防睡眠断言状态]
     S --> B{基础网络通过?}
     B -->|失败或未知| N[检查 Wi-Fi / 路由器 / 认证门户]
-    B -->|是| C{Clash 内核及代理端口正常?}
+    B -->|是| MODE{代理监听归属与模式一致?}
+    MODE -->|未知 / 不匹配| M
+    MODE -->|无监听且 auto 或 longma| MANUAL[人工打开选定客户端<br/>不猜测启动另一客户端]
+    MODE -->|龙猫云| P
+    MODE -->|Clash / 显式 clash 且端口空闲| C{Clash 内核及代理端口正常?}
     C -->|否| PORT{代理端口被其他客户端占用?}
     PORT -->|是或无法识别的内核| CONFLICT[保留现有代理 · 不启动 Clash]
     PORT -->|否| R[冷却允许时启动 Clash<br/>仍异常则正常重启一次]
@@ -26,7 +30,7 @@ flowchart TD
     C -->|是| P{双目标代理探测结果?}
     P -->|通过| LOG{近期有重复断流或整理失败?}
     LOG -->|无失败证据| OK([进入 ③ 应用与 Remote])
-    LOG -->|有| CROSS{模型与 Remote 均重复失败<br/>且已启用断流恢复?}
+    LOG -->|有| CROSS{当前为 Clash 且已启用恢复<br/>模型与 Remote 均重复失败?}
     CROSS -->|否| UNSTABLE[报告断流不稳定<br/>不重启 GPT]
     CROSS -->|是| SG
     P -->|4xx / 5xx 等未知| Q[报告无法确认<br/>不切节点 · 不重启 GPT]
@@ -34,18 +38,20 @@ flowchart TD
     W --> V{复检结果?}
     V -->|通过| LOG
     V -->|未知| Q
-    V -->|仍失败| SG([进入 ② 新加坡节点优选])
+    V -->|仍失败| CLIENT{当前客户端?}
+    CLIENT -->|Clash| SG([进入 ② 新加坡节点优选])
+    CLIENT -->|龙猫云| LM[提示龙猫云手动连接 / 换节点<br/>不调用 Clash 控制接口]
     classDef inspect fill:#eff6ff,stroke:#3b82f6,color:#172554;
     classDef action fill:#fffbeb,stroke:#f59e0b,color:#78350f;
     classDef stop fill:#fff1f2,stroke:#e11d48,color:#881337;
     classDef good fill:#ecfdf5,stroke:#10b981,color:#064e3b;
-    class L,U,S,B,C,P,V,LOG,CROSS,PORT inspect;
+    class L,U,S,B,C,P,V,LOG,CROSS,PORT,MODE,CLIENT inspect;
     class T,R,W action;
-    class M,N,Q,UNSTABLE,CONFLICT stop;
+    class M,N,Q,UNSTABLE,CONFLICT,MANUAL,LM stop;
     class OK,SG good;
 ```
 
-## ② 新加坡节点优选
+## ② 新加坡节点优选（仅 Clash）
 
 ```mermaid
 flowchart TD

@@ -1,5 +1,6 @@
 {
   "interval_seconds": 3600,
+  "proxy_client": "auto",
   "proxy_url": "http://127.0.0.1:7897",
   "basic_urls": ["https://www.baidu.com/", "https://www.qq.com/"],
   "general_url": "https://www.gstatic.com/generate_204",

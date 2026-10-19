@@ -48,6 +48,11 @@ class FakeMac:
     def proxy_port_open(self, cfg):
         return False
 
+    def proxy_client(self, cfg):
+        if self.core_result:
+            return "clash"
+        return "unknown" if self.proxy_port_open(cfg) else "none"
+
     def link(self, cfg):
         self.calls.append("link")
         return self.links.pop(0) if self.links else self.link_default
@@ -128,7 +133,7 @@ class WatchdogTests(unittest.TestCase):
         self.clock = Clock()
         self.mac = FakeMac(self.clock)
         self.api = FakeAPI()
-        self.cfg = dict(g.DEFAULTS, notifications=False,
+        self.cfg = dict(g.DEFAULTS, notifications=False, proxy_client="clash",
                         remote_evidence_file=str(self.path / "remote.json"),
                         task_evidence_file=str(self.path / "tasks.json"))
 

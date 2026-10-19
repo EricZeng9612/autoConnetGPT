@@ -23,10 +23,11 @@ import time
 from urllib.parse import quote, urlencode, urlsplit
 import transport_health
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 DEFAULT_DIR = Path.home() / "Library/Application Support/autoConnetGPT"
 DEFAULTS = {
     "interval_seconds": 3600, "proxy_url": "http://127.0.0.1:7897",
+    "proxy_client": "auto",
     "basic_urls": ["https://www.baidu.com/", "https://www.qq.com/"],
     "general_url": "https://www.gstatic.com/generate_204",
     "chatgpt_url": "https://chatgpt.com/cdn-cgi/trace",
@@ -109,6 +110,8 @@ def config_load(path):
         parsed = urlsplit(url)
         if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
             raise GuardError("Probes require credential-free HTTPS URLs")
+    if cfg["proxy_client"] not in ("auto", "clash", "longma"):
+        raise GuardError("proxy_client must be auto, clash or longma")
     for key in ("proxy_url", "controller_url"):
         parsed = urlsplit(cfg[key])
         if (parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "::1", "localhost")
@@ -240,8 +243,9 @@ class Mihomo:
 
 class Mac:
     @staticmethod
-    def run(argv, timeout=20):
-        env = dict(os.environ, LC_ALL="C", LANG="C")
+    def run(argv, timeout=20, unicode_output=False):
+        locale = "en_US.UTF-8" if unicode_output else "C"
+        env = dict(os.environ, LC_ALL=locale, LANG=locale)
         return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
 
     def http(self, url, proxy=None):
@@ -341,6 +345,54 @@ class Mac:
                 return True
         except OSError:
             return False
+
+    @staticmethod
+    def client_for_executable(executable):
+        if executable == "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo":
+            return "clash"
+        if executable == "/Applications/龙猫云_Lite.app/Contents/MacOS/lmclientCore":
+            return "longma"
+        return "unknown"
+
+    @staticmethod
+    def listener_pids(raw, host, port):
+        addresses = {host} if host != "localhost" else {"127.0.0.1", "::1"}
+        endpoints = {("[" + addr + "]" if ":" in addr else addr) + ":" + str(port)
+                     for addr in addresses} | {"*:" + str(port)}
+        pid, found = None, set()
+        for line in raw.splitlines():
+            if line.startswith("p"):
+                pid = int(line[1:]) if line[1:].isdigit() else None
+            elif line.startswith("n") and line[1:] in endpoints and pid is not None:
+                found.add(pid)
+        return found
+
+    def proxy_client(self, cfg):
+        """Classify the configured listener owner, not merely an open app window."""
+        url = urlsplit(cfg["proxy_url"])
+        try:
+            result = self.run(["/usr/sbin/lsof", "-nP", "-iTCP:" + str(url.port),
+                               "-sTCP:LISTEN", "-Fpn"], 5)
+            if result.returncode not in (0, 1):
+                return "unknown"
+            pids = self.listener_pids(result.stdout, url.hostname, url.port)
+            if not pids:
+                return "unknown" if self.proxy_port_open(cfg) else "none"
+            if len(pids) != 1:
+                return "ambiguous"
+            result = self.run(["/bin/ps", "-p", str(next(iter(pids))), "-o", "comm="], 5,
+                              unicode_output=True)
+            if result.returncode:
+                return "unknown"
+            client = self.client_for_executable(result.stdout.strip())
+            # Revalidate ownership after inspecting the process (exit/reuse race).
+            again = self.run(["/usr/sbin/lsof", "-nP", "-iTCP:" + str(url.port),
+                              "-sTCP:LISTEN", "-Fpn"], 5)
+            if again.returncode or self.listener_pids(again.stdout, url.hostname, url.port) != pids:
+                return "unknown"
+            return client
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return "unknown"
 
     def start(self, app):
         return self.run(["/usr/bin/open", "-g", "-j", "-a", app], 15).returncode == 0
@@ -469,18 +521,29 @@ class Watchdog:
         if self.dry:
             raise Halt("VPN_ROLLBACK_REQUIRED", "存在未完成节点事务；只读模式不回滚。")
         try:
+            self.require_clash()
             current = self.api.group(tx["group"]).get("now")
             if current not in (tx["candidate"], tx["original"]):
                 raise GuardError("User changed selection during recovery")
             if current != tx["original"]:
+                self.require_clash()
                 self.api.select(tx["group"], tx["original"])
             self.state["transaction"] = None
             self.save()
             self.actions.append("节点已恢复至原选择")
         except Exception:
-            raise Halt("VPN_ROLLBACK_REQUIRED", "原节点回滚未完成或选择被外部修改；停止自动操作，请检查 Clash。")
+            raise Halt("VPN_ROLLBACK_REQUIRED", "原节点回滚未完成，代理客户端/选择可能已变化；保留事务，不跨客户端操作，请检查 Clash。")
+
+    def require_clash(self):
+        if self.cfg["proxy_client"] == "longma" or self.mac.proxy_client(self.cfg) != "clash":
+            raise Halt("VPN_MODE_MISMATCH", "当前代理不是获准操作的 Clash；停止节点操作，不切换客户端。")
+
+    def verify_proxy_client(self):
+        if self.mac.proxy_client(self.cfg) != self.checks.get("proxy_client"):
+            raise Halt("VPN_MODE_MISMATCH", "巡检期间代理客户端发生变化；停止本轮恢复，下一轮重新识别。")
 
     def switch_nodes(self):
+        self.require_clash()
         group_name = self.cfg["selector_group"]
         if not group_name:
             raise Halt("VPN_CONFIG_REQUIRED", "代理链路故障；请先配置允许操作的 Selector 组和新加坡节点白名单。")
@@ -518,6 +581,7 @@ class Watchdog:
         original = group["now"]
         for latency, node in sorted(ranked)[:self.cfg["max_switches"]]:
             self.wait(0)
+            self.require_clash()
             if self.api.group(group_name).get("now") != original:
                 raise Halt("VPN_SELECTION_CHANGED", "节点选择已被外部修改，本轮停止。")
             if not self.api.route_group_active(group_name):
@@ -527,6 +591,7 @@ class Watchdog:
             accepted = False
             trial_started = self.clock()
             try:
+                self.require_clash()
                 self.api.select(group_name, node)
                 self.wait(5)
                 if self.mac.link(self.cfg) == "ok":
@@ -540,6 +605,7 @@ class Watchdog:
                                 and not transport_health.stream_failure(observation)
                                 and self.api.route_group_active(group_name))
                 if accepted:
+                    self.require_clash()
                     self.state["transaction"] = None
                     self.save()
                     self.actions.append("已切换至探测通过的新加坡节点，中位延迟 %.0f ms；仍需实际长任务验证" % latency)
@@ -563,7 +629,19 @@ class Watchdog:
         self.checks["basic_network"] = basic
         if basic != "ok":
             raise Halt("NETWORK_UNAVAILABLE", "基础网络不可用或无法确认；先检查 Wi-Fi、路由器、认证门户，不切节点或重启 GPT。")
-        if not self.mac.core(self.cfg):
+        requested = self.cfg["proxy_client"]
+        client = self.mac.proxy_client(self.cfg)
+        self.checks.update(proxy_client=client, proxy_client_requested=requested)
+        if client in ("unknown", "ambiguous"):
+            self.transport()
+            raise Halt("VPN_CLIENT_UNSUPPORTED", "代理端口的归属未知或不唯一；不启动客户端、不切节点，请检查端口占用。")
+        if client != "none" and requested not in ("auto", client):
+            raise Halt("VPN_MODE_MISMATCH", "配置的代理模式与实际端口提供者不同；保留当前客户端，不自动切换。")
+        if client == "none":
+            if requested != "clash":
+                raise Halt("VPN_CLIENT_UNAVAILABLE", "未检测到代理监听；请打开龙猫云或 Clash。自动模式不会猜测并启动另一个客户端。")
+            client = "clash"
+        if client == "clash" and not self.mac.core(self.cfg):
             self.checks["clash"] = "failed"
             if self.mac.proxy_port_open(self.cfg):
                 self.transport()
@@ -572,27 +650,35 @@ class Watchdog:
             self.mac.start("Clash Verge")
             self.wait(15)
             if not self.mac.core(self.cfg):
+                if self.mac.proxy_client(self.cfg) not in ("none", "clash"):
+                    raise Halt("VPN_MODE_MISMATCH", "启动期间端口已被其他客户端接管；不继续重启 Clash。")
                 if not self.mac.restart("Clash Verge"):
                     raise Halt("VPN_NEEDS_ATTENTION", "Clash 未能正常退出或启动，未强制结束进程。")
                 self.wait(15)
             if not self.mac.core(self.cfg):
                 raise Halt("VPN_NEEDS_ATTENTION", "Clash 内核或代理端口仍不可用。")
             self.actions.append("Clash 内核已恢复")
-        self.checks["clash"] = "ok"
+        self.checks["proxy_client"] = client
+        self.checks["clash"] = "ok" if client == "clash" else "not_selected"
+        self.verify_proxy_client()
         link = self.mac.link(self.cfg)
         if link == "failed" and not self.dry:
             self.wait(10)
             link = self.mac.link(self.cfg)
         self.checks["proxy_path"] = link
+        self.verify_proxy_client()
         if link == "unknown":
             raise Halt("VPN_PATH_UNKNOWN", "收到 4xx/5xx 等响应：不能证明服务可用，也不能认定 VPN 传输故障；不切节点或重启 GPT。")
         if link == "failed":
+            if client == "longma":
+                self.transport()
+                raise Halt("VPN_NEEDS_ATTENTION", "龙猫云代理探测未通过；请在龙猫云内检查连接、手动换可用新加坡节点并复检。不启动 Clash，不改龙猫云配置。")
             self.switch_nodes()
             self.checks["proxy_path"] = "ok"
         elif link == "ok":
             observation = self.transport()
             if transport_health.stream_failure(observation):
-                if (transport_health.cross_channel_failure(observation)
+                if (client == "clash" and transport_health.cross_channel_failure(observation)
                         and self.cfg["recover_stream_failures"] and not self.dry):
                     self.switch_nodes()
                 else:
@@ -624,6 +710,7 @@ class Watchdog:
             raise Halt("REMOTE_NEEDS_ATTENTION", "应用或 Remote 异常；只读模式未重启。")
         if self.mac.link(self.cfg) != "ok":
             raise Halt("VPN_PATH_UNKNOWN", "重启前代理复检未通过；取消 GPT 重启。")
+        self.verify_proxy_client()
         same, _ = self.same_app(proc)
         if not same:
             raise Halt("REMOTE_UNKNOWN", "应用实例已变化，取消重启，等待下一轮检查。")
@@ -736,6 +823,7 @@ class Watchdog:
                     self.save()
                 self.checks["sleep_assertion"] = self.mac.sleep_protected()
                 self.network()
+                self.verify_proxy_client()
                 self.application()
                 if transport_health.stream_failure(self.transport()):
                     raise Halt("STREAM_UNSTABLE", "应用检查完成，但最近 5 分钟仍有重复断流记录；尚未证实稳定恢复。")

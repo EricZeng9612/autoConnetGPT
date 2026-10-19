@@ -16,14 +16,30 @@ Auto Connect GPT 是一个面向中国大陆 macOS 用户的轻量级后台连�
 | 你遇到的情况 | 程序的处理方式 |
 |---|---|
 | 电脑空闲后睡眠，手机连接不到主机 | 守护期间维持防空闲睡眠断言；允许显示器正常熄屏 |
-| 分不清是 Wi-Fi、VPN 还是 GPT 出问题 | 按“基础网络 → Clash → 代理链路 → 应用 → Remote”分层检测 |
+| 分不清是 Wi-Fi、VPN 还是 GPT 出问题 | 按“基础网络 → 当前代理客户端 → 代理链路 → 应用 → Remote”分层检测 |
 | Clash 内核退出或本地代理端口失效 | 尝试启动，必要时正常退出并重启一次；受冷却限制 |
-| 代理链路持续故障，需要手动换节点 | 配置后，在可用的新加坡候选中按实测延迟从低到高尝试；失败回滚 |
+| 代理链路持续故障，需要手动换节点 | Clash 配置后优选新加坡节点并失败回滚；龙猫云提供检测结果和手动恢复 SOP |
 | ChatGPT 未运行 | 在网络正常及恢复额度允许时启动 |
 | App Server 或 Remote 异常 | 复检确认后，仅在能证明任务空闲时尝试正常重启；忙碌/未知则延后 |
 | 问题无法自动修复 | 保留状态、动作记录及人工处理 SOP；状态变化时通知 |
 
-## 必须知道的检测边界
+## 龙猫云与 Clash 双模式
+
+v2.2 保留两套代理适配，由 `config.json` 中的 `proxy_client` 选择。默认值为 `auto`。
+
+| 设置 | 行为 |
+|---|---|
+| `auto`（推荐） | 每轮检查当前配置代理端口的实际监听进程，识别龙猫云或 Clash；不自动切换客户端 |
+| `longma` | 明确使用龙猫云 Lite；检测代理链路、模型断流及应用/Remote，VPN 异常转人工 SOP |
+| `clash` | 明确使用 Clash Verge；保留受限启动/重启、配置后新加坡节点优选与回滚 |
+
+两种模式共享同一套应用/Remote 检查和任务空闲保护。**龙猫云模式不会调用 Clash 控制接口，不自动切换龙猫云节点或重启龙猫云**：目前尚未验证可安全使用的龙猫云控制接口。
+
+端口归属不明确、多个监听者或指定模式与实际客户端不一致时停止恢复；只有一个应用窗口打开并不足以判定模式。自动模式下没有监听者时提示人工打开客户端，不猜测启动哪个。显式 `clash` 模式才允许在端口未占用时启动 Clash。切换过程中若发现客户端变化，本轮立即停止；遗留 Clash 回滚事务不会跨到龙猫云执行。
+
+当前已验证的内核路径为 `/Applications/龙猫云_Lite.app/Contents/MacOS/lmclientCore` 和 `/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo`。其他版本/安装位置不冒认支持。`proxy_url` 必须与所用 HTTP/Mixed 代理端口一致；自动模式识别该端口，不扫描或修改系统代理、TUN、Codex 代理环境。
+
+## 断流与 Remote 检测边界
 
 **v2.1 可只读分析当前 App Server 的原生日志，识别 HTTP/SSE、模型 WebSocket、Remote 断流与上下文整理失败。** 日志绑定进程 PID 和启动时间，仅统计最近 5 分钟；主机 Remote 握手证据 120 秒后过期。没有日志、结构变化或证据不完整时保持未知，不推断手机在线。
 
@@ -55,7 +71,7 @@ flowchart LR
 
 ## 安装与升级
 
-环境要求：macOS、Python **3.9+**、当前用户已登录桌面；默认适配 `/Applications/ChatGPT.app` 和 `/Applications/Clash Verge.app`，HTTP 代理端口 `7897`。这不是独立 Codex.app 或其他 VPN 客户端的通用适配器。
+环境要求：macOS、Python **3.9+**、当前用户已登录桌面；默认适配 `/Applications/ChatGPT.app`，代理支持 Clash Verge 或龙猫云 Lite，HTTP/Mixed 代理端口默认 `7897`。这不是独立 Codex.app 或任意 VPN 客户端的通用适配器。
 
 ```bash
 git clone https://github.com/EricZeng9612/autoConnetGPT.git
@@ -72,7 +88,7 @@ zsh install.zsh
 
 ## 配置新加坡节点优选
 
-安装后编辑 `~/Library/Application Support/autoConnetGPT/config.json`，完整字段见 [配置示例](config.example.json)。下面只展示需要按实际情况修改的字段，其他字段保留：
+以下仅用于 Clash，龙猫云模式不会使用这些节点配置。安装后编辑 `~/Library/Application Support/autoConnetGPT/config.json`，完整字段见 [配置示例](config.example.json)。下面只展示需要按实际情况修改的字段，其他字段保留：
 
 ```json
 {
@@ -134,7 +150,9 @@ tail -f "$HOME/Library/Application Support/autoConnetGPT/autoConnetGPT.log"
 | `VPN_PATH_UNKNOWN` | HTTP 返回结果不够确定；人工辨别，不自动切换 |
 | `STREAM_UNSTABLE` | 近期存在重复断流/压缩失败；短请求或一次握手成功不足以确认恢复 |
 | `VPN_ROUTE_UNCONFIRMED` | 目标组未证实控制实际线路；检查当前代理模式及规则 |
-| `VPN_CLIENT_UNSUPPORTED` | 代理端口开放但没有受支持的 Clash 内核；不启动 Clash 与其他客户端争抢端口 |
+| `VPN_CLIENT_UNSUPPORTED` | 代理端口归属未知或不唯一；不抢占端口、不执行恢复 |
+| `VPN_MODE_MISMATCH` | 指定模式不匹配或检查期间客户端变化；不切换客户端、不重启 GPT |
+| `VPN_CLIENT_UNAVAILABLE` | 未发现代理监听；自动/龙猫云模式提示人工打开客户端 |
 | `VPN_CONFIG_REQUIRED` / `VPN_NO_SG_NODE` | 需配置代理组/候选，或本轮没有通过测试的新加坡节点 |
 | `VPN_CONTROLLER_UNAVAILABLE` | 检查本地控制接口和密钥权限 |
 | `VPN_ROLLBACK_REQUIRED` / `VPN_SELECTION_CHANGED` | 回滚受阻或外部修改节点，停止自动操作 |
